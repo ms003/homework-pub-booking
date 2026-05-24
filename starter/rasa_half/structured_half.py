@@ -1,15 +1,24 @@
-"""Ex6 — RasaStructuredHalf reference solution.
+"""Ex6 — Rasa-backed structured half for booking confirmation.
 
-Two paths:
-  1. Real Rasa Pro container (default when RASA_PRO_LICENSE is set).
-     Uses docker-compose to spawn rasa + action-server, waits for
-     health, POSTs to /webhooks/rest/webhook, tears down on exit.
-  2. Stdlib mock server (when RASA_PRO_LICENSE is empty or --mock
-     is passed). Lets students without a license progress through
-     HTTP-contract tests.
+This module replaces the minimal in-process StructuredHalf with a real
+HTTP bridge to Rasa's REST webhook. The flow is:
 
-The mock is intentionally kept — it's how students validate their
-normalise_booking_payload and HTTP wiring BEFORE signing up for Rasa.
+  1. Receive a dict of booking intent from the loop half.
+  2. Normalise it with validator.normalise_booking_payload().
+  3. POST the Rasa-shaped message to /webhooks/rest/webhook.
+  4. Convert Rasa's response into a HalfResult for the agent runtime.
+
+Compared with ref.py, this version also fail-closes on booking policy:
+if the normalised payload is over the party-size or deposit cap, the
+structured half returns an escalation even if a stale/noisy Rasa response
+appears to confirm it. The same rule is mirrored by the stdlib mock server.
+
+Runtime support is split into two practical paths:
+
+  * RasaHostLifecycle starts rasa-pro and the action server as host
+    processes from rasa_project/ for real integration runs.
+  * spawn_mock_rasa starts a stdlib HTTP server with the same accept/reject
+    contract, so Ex6 can be tested without a Rasa license.
 """
 
 from __future__ import annotations
@@ -35,10 +44,38 @@ from starter.rasa_half.validator import normalise_booking_payload
 
 RASA_REST_WEBHOOK_DEFAULT = "http://localhost:5005/webhooks/rest/webhook"
 _SOLUTION_EX6 = Path(__file__).resolve().parent
+MAX_PARTY_SIZE_FOR_AUTO_BOOKING = 8
+MAX_DEPOSIT_FOR_AUTO_BOOKING_GBP = 300
+
+
+def _booking_policy_violation(booking: dict) -> str | None:
+    """Return the policy rejection reason for a normalised booking, if any."""
+    try:
+        party_size = int(booking.get("party_size", 0))
+    except (TypeError, ValueError):
+        return "invalid_party_size"
+
+    try:
+        deposit_gbp = int(booking.get("deposit_gbp", 0))
+    except (TypeError, ValueError):
+        return "invalid_deposit"
+
+    if party_size > MAX_PARTY_SIZE_FOR_AUTO_BOOKING:
+        return "party_too_large"
+
+    if deposit_gbp > MAX_DEPOSIT_FOR_AUTO_BOOKING_GBP:
+        return "deposit_too_high"
+
+    return None
 
 
 class RasaStructuredHalf(StructuredHalf):
-    """Routes booking data through Rasa CALM flows via HTTP."""
+    """Route booking data through Rasa and return a structured HalfResult.
+
+    The class is intentionally small: validation and normalisation live in
+    validator.py, policy validation is checked locally as a fail-closed guard,
+    and Rasa remains responsible for the structured dialogue response.
+    """
 
     name = "rasa"
 
@@ -46,25 +83,29 @@ class RasaStructuredHalf(StructuredHalf):
         self,
         *,
         rasa_url: str = RASA_REST_WEBHOOK_DEFAULT,
-        sender_id_prefix: str = "homework",
         request_timeout_s: float = 30.0,
     ) -> None:
         super().__init__(rules=[])
         self.rasa_url = rasa_url
-        self.sender_id_prefix = sender_id_prefix
         self.request_timeout_s = request_timeout_s
 
     def discover(self) -> DiscoverySchema:
         return {
             "name": self.name,
             "kind": "half",
-            "description": "Rasa CALM-backed structured half for booking confirmation.",
-            "parameters": {"type": "object"},
+            "description": "Rasa-backed structured half for booking confirmation.",
+            "parameters": {"type": "object", "properties": {"data": {"type": "object"}}},
             "returns": {"type": "object"},
             "error_codes": ["SA_EXT_SERVICE_UNAVAILABLE", "SA_EXT_TIMEOUT"],
             "examples": [
                 {
-                    "input": {"data": {"action": "confirm_booking", "deposit_gbp": 200}},
+                    "input": {
+                        "data": {
+                            "action": "confirm_booking",
+                            "party_size": 4,
+                            "deposit_gbp": 200,
+                        }
+                    },
                     "output": {"success": True, "next_action": "complete"},
                 }
             ],
@@ -73,26 +114,35 @@ class RasaStructuredHalf(StructuredHalf):
         }
 
     async def run(self, session: Session, input_payload: dict) -> HalfResult:
+        """Normalise booking data, call Rasa, and interpret the response.
+
+        Success returns ``next_action="complete"`` with the committed booking
+        and booking reference. Validation failures, transport failures, Rasa
+        rejections, or local policy violations return ``next_action="escalate"``
+        with the normalised booking and reason where available.
+        """
         data = input_payload.get("data") if isinstance(input_payload, dict) else None
-        if not data:
+
+        if not isinstance(data, dict):
             return HalfResult(
                 success=False,
                 output={"error": "input_payload missing 'data' dict"},
-                summary="no data in input_payload",
+                summary="no booking data provided",
                 next_action="escalate",
             )
 
         try:
             rasa_msg = normalise_booking_payload(data)
-        except Exception as e:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             return HalfResult(
                 success=False,
-                output={"error": str(e), "raw": data},
-                summary=f"normalisation failed: {e}",
+                output={"error": str(exc), "raw": data},
+                summary=f"normalisation failed: {exc}",
                 next_action="escalate",
             )
 
         booking = rasa_msg["metadata"]["booking"]
+
         body = json.dumps(
             {
                 "sender": rasa_msg["sender"],
@@ -100,6 +150,7 @@ class RasaStructuredHalf(StructuredHalf):
                 "metadata": {"booking": booking},
             }
         ).encode("utf-8")
+
         req = urllib_request.Request(
             self.rasa_url,
             data=body,
@@ -110,34 +161,41 @@ class RasaStructuredHalf(StructuredHalf):
         try:
             raw_response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: urllib_request.urlopen(req, timeout=self.request_timeout_s).read(),
+                lambda: urllib_request.urlopen(
+                    req,
+                    timeout=self.request_timeout_s,
+                ).read(),
             )
-        except HTTPError as e:
+        except HTTPError as exc:
             return HalfResult(
                 success=False,
                 output={
-                    "error": f"rasa HTTP {e.code}",
+                    "error": f"rasa HTTP {exc.code}",
                     "error_code": "SA_EXT_SERVICE_UNAVAILABLE",
                     "booking": booking,
                 },
-                summary=f"rasa returned HTTP {e.code}",
+                summary=f"rasa returned HTTP {exc.code}",
                 next_action="escalate",
             )
-        except URLError as e:
+        except URLError as exc:
             return HalfResult(
                 success=False,
                 output={
-                    "error": str(e),
+                    "error": str(exc),
                     "error_code": "SA_EXT_SERVICE_UNAVAILABLE",
                     "booking": booking,
                 },
-                summary=f"rasa unreachable: {e}",
+                summary=f"rasa unreachable: {exc}",
                 next_action="escalate",
             )
         except TimeoutError:
             return HalfResult(
                 success=False,
-                output={"error": "timeout", "error_code": "SA_EXT_TIMEOUT"},
+                output={
+                    "error": "timeout",
+                    "error_code": "SA_EXT_TIMEOUT",
+                    "booking": booking,
+                },
                 summary="rasa request timed out",
                 next_action="escalate",
             )
@@ -151,7 +209,7 @@ class RasaStructuredHalf(StructuredHalf):
                     "error": "rasa returned non-JSON",
                     "raw": raw_response[:200].decode("utf-8", errors="replace"),
                 },
-                summary="rasa response not JSON",
+                summary="rasa response was not JSON",
                 next_action="escalate",
             )
 
@@ -159,22 +217,43 @@ class RasaStructuredHalf(StructuredHalf):
         rejected = False
         rejection_reason = ""
         booking_reference = None
-        for m in messages:
-            if not isinstance(m, dict):
+        policy_violation = _booking_policy_violation(booking)
+
+        for message in messages:
+            if not isinstance(message, dict):
                 continue
-            text = (m.get("text") or "").lower()
-            custom = m.get("custom") or {}
+
+            text = (message.get("text") or "").lower()
+            custom = message.get("custom") or {}
             action = custom.get("action") if isinstance(custom, dict) else None
 
             if action == "committed" or "booking confirmed" in text:
                 confirmed = True
+
                 if isinstance(custom, dict):
                     booking_reference = custom.get("booking_reference")
-                if "reference:" in text and not booking_reference:
+
+                if "reference:" in text and booking_reference is None:
                     booking_reference = text.split("reference:", 1)[1].strip().rstrip(".").upper()
+
             if action == "rejected" or "can't accept" in text or "rejected" in text:
                 rejected = True
                 rejection_reason = text or "rejected by rasa"
+
+        if policy_violation:
+            reason = rejection_reason or policy_violation
+            return HalfResult(
+                success=False,
+                output={
+                    "rejected": True,
+                    "reason": reason,
+                    "policy_violation": policy_violation,
+                    "booking": booking,
+                    "rasa_response": messages,
+                },
+                summary=f"rasa rejected booking: {reason}",
+                next_action="escalate",
+            )
 
         if confirmed and not rejected:
             return HalfResult(
@@ -195,23 +274,23 @@ class RasaStructuredHalf(StructuredHalf):
                 output={
                     "rejected": True,
                     "reason": rejection_reason,
-                    "rasa_response": messages,
                     "booking": booking,
+                    "rasa_response": messages,
                 },
-                summary=f"rasa rejected: {rejection_reason}",
+                summary=f"rasa rejected booking: {rejection_reason}",
                 next_action="escalate",
             )
 
         return HalfResult(
             success=False,
             output={
+                "booking": booking,
                 "rasa_response": messages,
                 "note": "neither confirmation nor rejection detected",
             },
             summary="rasa returned unexpected output",
             next_action="escalate",
         )
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Host-process Rasa orchestration (no Docker)
@@ -220,7 +299,7 @@ class RasaStructuredHalf(StructuredHalf):
 
 class RasaHostLifecycle:
     """Spawn rasa-pro + action-server as host processes, wait for health,
-    tear down. Uses the uv-managed venv's `rasa` CLI directly.
+    tear down. Uses `rasa_project`'s uv-managed `rasa` CLI directly.
 
     Usage:
         async with RasaHostLifecycle(log_dir=Path(...)) as url:
@@ -248,9 +327,7 @@ class RasaHostLifecycle:
         log_dir: Path | None = None,
     ) -> None:
         # Default to the homework's rasa_project/ at the repo root
-        self.rasa_project_dir = rasa_project_dir or (
-            _SOLUTION_EX6.parent.parent.parent / "rasa_project"
-        )
+        self.rasa_project_dir = rasa_project_dir or (_SOLUTION_EX6.parent.parent / "rasa_project")
         self.rasa_port = rasa_port
         self.action_port = action_port
         self.startup_timeout_s = startup_timeout_s
@@ -269,11 +346,11 @@ class RasaHostLifecycle:
                 pass
 
     async def __aenter__(self) -> str:
-        if not os.environ.get("RASA_PRO_LICENSE"):
+        if not (os.environ.get("RASA_PRO_LICENSE") or os.environ.get("RASA_LICENSE")):
             raise RuntimeError(
-                "RASA_PRO_LICENSE is not set. Rasa Pro refuses to start "
-                "without a license. Set it in your .env, or use the mock "
-                "server (spawn_mock_rasa) as a fallback."
+                "RASA_PRO_LICENSE/RASA_LICENSE is not set. Rasa Pro refuses "
+                "to start without a license. Set one in your .env, or use "
+                "the mock server (spawn_mock_rasa) as a fallback."
             )
 
         if not self.rasa_project_dir.exists():
@@ -284,7 +361,7 @@ class RasaHostLifecycle:
 
         self._log(f"▶ training Rasa model in {self.rasa_project_dir}")
         train_rc = self._run_sync(
-            ["rasa", "train"],
+            ["uv", "run", "rasa", "train"],
             cwd=self.rasa_project_dir,
             timeout=240,
             log_name="rasa_train.log",
@@ -296,7 +373,7 @@ class RasaHostLifecycle:
         # Action server first (Rasa talks to it)
         self._log(f"▶ starting action server on :{self.action_port}")
         self._action_proc = self._spawn_bg(
-            ["rasa", "run", "actions", "-p", str(self.action_port)],
+            ["uv", "run", "rasa", "run", "actions", "-p", str(self.action_port)],
             cwd=self.rasa_project_dir,
             log_name="rasa_actions.log",
         )
@@ -305,6 +382,8 @@ class RasaHostLifecycle:
         self._log(f"▶ starting rasa server on :{self.rasa_port}")
         self._rasa_proc = self._spawn_bg(
             [
+                "uv",
+                "run",
                 "rasa",
                 "run",
                 "--enable-api",
@@ -388,7 +467,7 @@ class RasaHostLifecycle:
         except FileNotFoundError as e:
             raise RuntimeError(
                 f"Command not found: {cmd[0]!r}. Install rasa-pro into the "
-                "venv: `uv sync --all-groups --extra rasa` or `pip install rasa-pro`"
+                "Rasa env: `cd rasa_project && uv sync`"
             ) from e
 
     def _run_sync(self, cmd: list[str], *, cwd: Path, timeout: int, log_name: str) -> int:
